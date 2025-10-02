@@ -21,12 +21,22 @@ vocab_size = 1000
 embedding_size = 128
 hidden_size = 256
 num_layers = 1
-num_blocks = 2
+num_blocks = 4
 batch_size = 64
 seq_length = 20
 num_epochs = 5
 learning_rate = 0.0001
 clip_value = 1.0
+
+# Choose LSTM type configuration:
+# Option 1: All same type
+# lstm_type = "slstm"  # or "mlstm"
+
+# Option 2: Alternating pattern (recommended for mixed architecture)
+lstm_type = "alternate"  # alternates between slstm and mlstm
+
+# Option 3: Custom pattern
+# lstm_type = ["slstm", "mlstm", "slstm", "mlstm"]
 
 class DummyDataset(torch.utils.data.Dataset):
     def __init__(self, vocab_size, seq_length, num_samples):
@@ -39,7 +49,16 @@ class DummyDataset(torch.utils.data.Dataset):
         return self.data[idx]
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-model = xLSTM(vocab_size, embedding_size, hidden_size, num_layers, num_blocks).to(device)
+print(f"Using device: {device}")
+
+# Create model with mixed block types
+model = xLSTM(vocab_size, embedding_size, hidden_size, num_layers, num_blocks, 
+              dropout=0.1, lstm_type=lstm_type).to(device)
+
+# Print model architecture
+print("\n" + "="*60)
+model.print_architecture()
+print("="*60 + "\n")
 
 def init_weights(m):
     if type(m) in [nn.Linear, nn.Embedding]:
@@ -54,7 +73,9 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 train_dataset = DummyDataset(vocab_size, seq_length, 1000)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
+print(f"Starting training with {len(train_dataset)} samples...")
 start_time = time.time()
+
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
@@ -110,4 +131,4 @@ for epoch in range(num_epochs):
     print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
 
 end_time = time.time()
-print(f"Training completed! Total time: {end_time - start_time:.2f} seconds")
+print(f"\nTraining completed! Total time: {end_time - start_time:.2f} seconds")

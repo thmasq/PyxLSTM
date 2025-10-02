@@ -53,7 +53,7 @@ class mLSTM(nn.Module):
         batch_size, seq_length, _ = input_seq.size()
         
         if hidden_state is None:
-            hidden_state = self.init_hidden(batch_size)
+            hidden_state = self.init_hidden(batch_size, input_seq.device)
         
         outputs = []
         for t in range(seq_length):
@@ -67,10 +67,12 @@ class mLSTM(nn.Module):
         
         return torch.stack(outputs, dim=1), hidden_state
 
-    def init_hidden(self, batch_size):
+    def init_hidden(self, batch_size, device=None):
         """Initialize hidden state for all layers."""
-        return [(torch.zeros(batch_size, self.hidden_size, device=self.layers[0].weight_ih.device),
-                 torch.zeros(batch_size, self.hidden_size, self.hidden_size, device=self.layers[0].weight_ih.device))
+        if device is None:
+            device = self.layers[0].weight_ih.device
+        return [(torch.zeros(batch_size, self.hidden_size, device=device),
+                 torch.zeros(batch_size, self.hidden_size, self.hidden_size, device=device))
                 for _ in range(self.num_layers)]
 
 class mLSTMCell(nn.Module):
@@ -89,27 +91,36 @@ class mLSTMCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         
+        # Gate parameters (input, forget, output)
         self.weight_ih = nn.Parameter(torch.randn(3 * hidden_size, input_size))
         self.weight_hh = nn.Parameter(torch.randn(3 * hidden_size, hidden_size))
         self.bias = nn.Parameter(torch.randn(3 * hidden_size))
         
-        self.W_q = nn.Linear(input_size, hidden_size)
-        self.W_k = nn.Linear(input_size, hidden_size)
-        self.W_v = nn.Linear(input_size, hidden_size)
+        # Query, Key, Value projections
+        self.W_q = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_k = nn.Linear(input_size, hidden_size, bias=False)
+        self.W_v = nn.Linear(input_size, hidden_size, bias=False)
         
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Initialize parameters using Xavier uniform initialization."""
+        """Initialize parameters using Xavier uniform initialization with stability improvements."""
         nn.init.xavier_uniform_(self.weight_ih)
         nn.init.xavier_uniform_(self.weight_hh)
-        nn.init.zeros_(self.bias)
-        nn.init.xavier_uniform_(self.W_q.weight)
-        nn.init.xavier_uniform_(self.W_k.weight)
-        nn.init.xavier_uniform_(self.W_v.weight)
-        nn.init.zeros_(self.W_q.bias)
-        nn.init.zeros_(self.W_k.bias)
-        nn.init.zeros_(self.W_v.bias)
+        
+        # Initialize biases for gates to negative values for stability
+        # This starts with smaller gate values (closer to 0 after exp)
+        with torch.no_grad():
+            # Input and forget gate biases
+            self.bias[:self.hidden_size].fill_(-3.0)  # input gate
+            self.bias[self.hidden_size:2*self.hidden_size].fill_(-3.0)  # forget gate
+            # Output gate bias
+            self.bias[2*self.hidden_size:].fill_(0.0)  # output gate
+        
+        # Initialize projection weights with smaller scale
+        nn.init.xavier_uniform_(self.W_q.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.W_k.weight, gain=0.5)
+        nn.init.xavier_uniform_(self.W_v.weight, gain=0.5)
 
     def forward(self, input, hx):
         """
@@ -117,25 +128,40 @@ class mLSTMCell(nn.Module):
 
         Args:
             input (Tensor): Input tensor of shape (batch_size, input_size).
-            hx (tuple of Tensors): Previous hidden state and cell state.
+            hx (tuple of Tensors): Previous hidden state and cell state (h, C).
 
         Returns:
-            tuple: New hidden state and cell state.
+            tuple: New hidden state and cell state (h_new, C_new).
         """
         h, C = hx
-        gates = F.linear(input, self.weight_ih, self.bias) + F.linear(h, self.weight_hh)
         
+        # Compute gates
+        gates = F.linear(input, self.weight_ih, self.bias) + F.linear(h, self.weight_hh)
         i, f, o = gates.chunk(3, 1)
         
-        i = torch.exp(i)  # Exponential input gate
-        f = torch.exp(f)  # Exponential forget gate
+        # Stabilized exponential gating with stricter clamping
+        i = torch.exp(torch.clamp(i, min=-15, max=8))  # exp(8) ≈ 2981
+        f = torch.exp(torch.clamp(f, min=-15, max=8))  
         o = torch.sigmoid(o)
         
-        q = self.W_q(input)
-        k = self.W_k(input)
+        # Compute query, key, value with scaling
+        q = self.W_q(input) / (self.hidden_size ** 0.5)  # Scale by sqrt(d)
+        k = self.W_k(input) / (self.hidden_size ** 0.5)
         v = self.W_v(input)
         
-        C = f.unsqueeze(2) * C + i.unsqueeze(2) * torch.bmm(v.unsqueeze(2), k.unsqueeze(1))
-        h = o * torch.bmm(q.unsqueeze(1), C).squeeze(1)
+        # Update cell state: C = f*C + i*(v ⊗ k^T)
+        # Using scaled outer product for stability
+        outer_product = torch.bmm(v.unsqueeze(2), k.unsqueeze(1))
         
-        return h, C
+        # Apply gates with stability factor
+        C_new = f.unsqueeze(2) * C + i.unsqueeze(2) * outer_product
+        
+        # Optional: Apply soft normalization to prevent unbounded growth
+        # This doesn't strictly normalize but dampens extreme values
+        scale = 1.0 / (1.0 + C_new.abs().max().item() / 10.0)
+        C_new = C_new * scale
+        
+        # Compute hidden state: h = o * (q^T @ C)
+        h_new = o * torch.bmm(q.unsqueeze(1), C_new).squeeze(1)
+        
+        return h_new, C_new

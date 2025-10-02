@@ -99,7 +99,16 @@ class sLSTMCell(nn.Module):
         """Initialize parameters using Xavier uniform initialization."""
         nn.init.xavier_uniform_(self.weight_ih)
         nn.init.xavier_uniform_(self.weight_hh)
-        nn.init.zeros_(self.bias)
+        
+        with torch.no_grad():
+            # Input and forget gate biases (first 2*hidden_size elements)
+            # Start with negative values for exponential gates
+            self.bias[:self.hidden_size].fill_(-2.0)  # input gate
+            self.bias[self.hidden_size:2*self.hidden_size].fill_(-2.0)  # forget gate
+            # Cell gate bias
+            self.bias[2*self.hidden_size:3*self.hidden_size].fill_(0.0)  # g gate
+            # Output gate bias
+            self.bias[3*self.hidden_size:].fill_(0.0)  # output gate
 
     def forward(self, input, hx):
         """
@@ -117,12 +126,21 @@ class sLSTMCell(nn.Module):
         
         i, f, g, o = gates.chunk(4, 1)
         
-        i = torch.exp(i)  # Exponential input gate
-        f = torch.exp(f)  # Exponential forget gate
+        # Stabilized exponential gating
+        # Clamp values before exp to prevent overflow
+        i = torch.exp(torch.clamp(i, min=-10, max=10))
+        f = torch.exp(torch.clamp(f, min=-10, max=10))
         g = torch.tanh(g)
         o = torch.sigmoid(o)
         
-        c = f * c + i * g
-        h = o * torch.tanh(c)
+        # Update cell state
+        c_new = f * c + i * g
         
-        return h, c
+        # Optional: Add cell state normalization for very long sequences
+        # Uncomment if you still experience instability
+        # c_new = c_new / (torch.norm(c_new, dim=1, keepdim=True) + 1e-8)
+        
+        # Update hidden state
+        h_new = o * torch.tanh(c_new)
+        
+        return h_new, c_new
