@@ -4,18 +4,18 @@ Multi-Step Financial Forecasting with xLSTM
 This example demonstrates multi-step ahead forecasting using xLSTM.
 """
 
-import torch
-import torch.nn as nn
-import numpy as np
-import pandas as pd
 import os
 import sys
+
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from utils.financial_data import create_financial_dataloaders, generate_synthetic_financial_data
 from xLSTM import xLSTM
-from utils.financial_data import generate_synthetic_financial_data, create_financial_dataloaders
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
     prediction_horizon = 10  # Predict 10 steps ahead
     batch_size = 32
     num_epochs = 30
-    learning_rate = 0.001
+    learning_rate = 0.0001
     hidden_size = 128
     num_layers = 2
     num_blocks = 4

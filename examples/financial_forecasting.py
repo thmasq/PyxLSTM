@@ -114,7 +114,7 @@ def main():
     prediction_horizon = 1  # Predict next step
     batch_size = 64
     num_epochs = 50
-    learning_rate = 0.001
+    learning_rate = 0.0001
     hidden_size = 128
     num_layers = 2
     num_blocks = 4
