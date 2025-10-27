@@ -8,9 +8,125 @@ Author: Mudit Bhargava (Adapted for Financial Data)
 Date: October 2025
 """
 
+from dataclasses import dataclass
+from typing import Dict, List, Type
+
 import torch.nn as nn
+from torch.optim import Optimizer
 
 from .block import xLSTMBlock
+
+
+@dataclass
+class LearningRateConfig:
+    """Configuration for per-block learning rates."""
+
+    learning_rates: Dict[str, float]
+
+    @classmethod
+    def uniform(cls, lr: float):
+        """Create uniform learning rate config."""
+        return cls(learning_rates={"default": lr})
+
+    @classmethod
+    def per_block_type(cls, slstm_lr: float, mlstm_lr: float, other_lr: float):
+        """Create learning rate config with different rates for block types."""
+        return cls(learning_rates={"slstm": slstm_lr, "mlstm": mlstm_lr, "other": other_lr})
+
+
+class PerBlockOptimizer:
+    """
+    Optimizer wrapper that applies different learning rates to different parts of the model.
+
+    This allows for fine-grained control over learning rates for sLSTM blocks, mLSTM blocks,
+    and other model components.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer_class: Type[Optimizer],
+        lr_config: LearningRateConfig,
+        **optimizer_kwargs,
+    ):
+        self.model = model
+        self.lr_config = lr_config
+
+        # Group parameters by block type
+        param_groups = self._create_param_groups()
+
+        # Create optimizer with per-group learning rates
+        self.optimizer = optimizer_class(param_groups, **optimizer_kwargs)
+
+        # Store initial LRs for warmup/scheduling
+        for group in self.optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+
+    def _create_param_groups(self) -> List[Dict]:
+        """Create parameter groups with appropriate learning rates."""
+        param_groups = []
+
+        # Get default LR
+        default_lr = self.lr_config.learning_rates.get("default", 1e-4)
+        other_lr = self.lr_config.learning_rates.get("other", default_lr)
+
+        # Group parameters by block type
+        slstm_params = []
+        mlstm_params = []
+        other_params = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Check if parameter belongs to a specific block
+            if "blocks." in name:
+                block_idx = int(name.split("blocks.")[1].split(".")[0])
+                block_type = self.model.block_types[block_idx]
+
+                if block_type == "slstm":
+                    slstm_params.append(param)
+                elif block_type == "mlstm":
+                    mlstm_params.append(param)
+                else:
+                    other_params.append(param)
+            else:
+                other_params.append(param)
+
+        # Create parameter groups with appropriate LRs
+        if slstm_params:
+            slstm_lr = self.lr_config.learning_rates.get("slstm", default_lr)
+            param_groups.append({"params": slstm_params, "lr": slstm_lr})
+
+        if mlstm_params:
+            mlstm_lr = self.lr_config.learning_rates.get("mlstm", default_lr)
+            param_groups.append({"params": mlstm_params, "lr": mlstm_lr})
+
+        if other_params:
+            param_groups.append({"params": other_params, "lr": other_lr})
+
+        return param_groups
+
+    def zero_grad(self, set_to_none: bool = False):
+        """Zero gradients."""
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        """Perform optimization step."""
+        return self.optimizer.step(closure)
+
+    def state_dict(self):
+        """Get optimizer state."""
+        return self.optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        """Load optimizer state."""
+        self.optimizer.load_state_dict(state_dict)
+
+    @property
+    def param_groups(self):
+        """Access parameter groups."""
+        return self.optimizer.param_groups
 
 
 class xLSTM(nn.Module):

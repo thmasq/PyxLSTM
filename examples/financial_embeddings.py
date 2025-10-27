@@ -3,7 +3,7 @@ Financial Time Series Forecasting with xLSTM using Embeddings
 
 This example demonstrates how to use xLSTM for financial forecasting
 using pre-computed embeddings from embeddings_128.csv, with support
-for per-block learning rates.
+for per-block learning rates and cosine annealing.
 
 This is a port of the Rust xlstm-rs implementation.
 
@@ -27,14 +27,34 @@ from xLSTM.model import LearningRateConfig, PerBlockOptimizer, xLSTM
 
 
 def train_model(
-    model, train_loader, test_loader, test_price_pairs, lr_config, num_epochs=20, device="cpu", weight_decay=1e-4
+    model,
+    train_loader,
+    test_loader,
+    test_price_pairs,
+    lr_config,
+    num_epochs=20,
+    device="cpu",
+    weight_decay=1e-4,
+    use_cosine_annealing=True,
+    eta_min=1e-6,
+    warmup_epochs=0,
 ):
-    """Train the model with per-block learning rates."""
+    """Train the model with per-block learning rates and cosine annealing."""
 
     # Create optimizer with per-block learning rates
     optimizer = PerBlockOptimizer(
         model, torch.optim.Adam, lr_config, betas=(0.9, 0.999), eps=1e-8, weight_decay=weight_decay
     )
+
+    # Create cosine annealing scheduler
+    if use_cosine_annealing:
+        # For warmup, we'll manually adjust LR for first few epochs
+        T_max = num_epochs - warmup_epochs
+        # Use the wrapped optimizer for the scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer.optimizer, T_max=T_max, eta_min=eta_min)
+        print(f"Using Cosine Annealing: T_max={T_max}, eta_min={eta_min}, warmup_epochs={warmup_epochs}\n")
+    else:
+        scheduler = None
 
     criterion = nn.MSELoss()
 
@@ -44,6 +64,12 @@ def train_model(
     best_val_loss = float("inf")
 
     for epoch in range(num_epochs):
+        # Warmup: gradually increase LR for first few epochs
+        if use_cosine_annealing and epoch < warmup_epochs:
+            warmup_factor = (epoch + 1) / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = param_group["initial_lr"] * warmup_factor
+
         model.train()
         total_loss = 0.0
         num_batches = 0
@@ -73,16 +99,26 @@ def train_model(
 
         avg_loss = total_loss / num_batches
 
+        # Step scheduler after warmup
+        if use_cosine_annealing and epoch >= warmup_epochs:
+            scheduler.step()
+
+        # Get current learning rates
+        current_lrs = [param_group["lr"] for param_group in optimizer.param_groups]
+
         # Validation
         if epoch % 5 == 0:
             val_loss = evaluate(model, test_loader, criterion, device)
             print(f"Epoch [{epoch + 1:2d}/{num_epochs}], Train Loss: {avg_loss:.6f}, Val Loss: {val_loss:.6f}")
+            print(f"  LRs: {[f'{lr:.2e}' for lr in current_lrs[:3]]}")  # Show first 3 LRs
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(model.state_dict(), "best_xlstm_model.pt")
         else:
             print(f"Epoch [{epoch + 1:2d}/{num_epochs}], Train Loss: {avg_loss:.6f}")
+            if epoch % 10 == 0:
+                print(f"  LRs: {[f'{lr:.2e}' for lr in current_lrs[:3]]}")
 
     print("\nTraining completed!")
     return best_val_loss
@@ -245,6 +281,10 @@ def train_mode(args):
     print(f"    mLSTM blocks: {args.mlstm_lr}")
     print(f"    Other layers: {args.other_lr}")
     print(f"  Weight decay: {args.weight_decay}")
+    if args.use_cosine_annealing:
+        print(f"  Cosine Annealing: enabled (eta_min={args.eta_min}, warmup={args.warmup_epochs})")
+    else:
+        print("  Cosine Annealing: disabled")
     print()
 
     # Device
@@ -291,7 +331,19 @@ def train_mode(args):
     print()
 
     # Train
-    train_model(model, train_loader, test_loader, test_price_pairs, lr_config, num_epochs, device, args.weight_decay)
+    train_model(
+        model,
+        train_loader,
+        test_loader,
+        test_price_pairs,
+        lr_config,
+        num_epochs,
+        device,
+        args.weight_decay,
+        use_cosine_annealing=args.use_cosine_annealing,
+        eta_min=args.eta_min,
+        warmup_epochs=args.warmup_epochs,
+    )
 
     # Save model
     model_path = args.model_path
@@ -402,6 +454,8 @@ def continue_mode(args):
     print(f"    sLSTM blocks: {args.slstm_lr * 0.5}")
     print(f"    mLSTM blocks: {args.mlstm_lr * 0.5}")
     print(f"    Other layers: {args.other_lr * 0.5}")
+    if args.use_cosine_annealing:
+        print(f"  Cosine Annealing: enabled (eta_min={args.eta_min})")
     print()
 
     # Device
@@ -440,7 +494,19 @@ def continue_mode(args):
 
     # Continue training
     print(f"Continuing training for {num_epochs} more epochs...\n")
-    train_model(model, train_loader, test_loader, test_price_pairs, lr_config, num_epochs, device, args.weight_decay)
+    train_model(
+        model,
+        train_loader,
+        test_loader,
+        test_price_pairs,
+        lr_config,
+        num_epochs,
+        device,
+        args.weight_decay,
+        use_cosine_annealing=args.use_cosine_annealing,
+        eta_min=args.eta_min,
+        warmup_epochs=0,  # No warmup for continued training
+    )
 
     # Save updated model
     updated_model_path = args.model_path.replace(".pt", "_continued.pt")
@@ -483,6 +549,16 @@ def main():
     parser.add_argument("--mlstm-lr", type=float, default=1e-5, help="Learning rate for mLSTM blocks")
     parser.add_argument("--other-lr", type=float, default=1e-4, help="Learning rate for other components")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay")
+
+    # Cosine annealing parameters
+    parser.add_argument(
+        "--use-cosine-annealing", action="store_true", default=True, help="Use cosine annealing LR scheduler"
+    )
+    parser.add_argument(
+        "--no-cosine-annealing", action="store_false", dest="use_cosine_annealing", help="Disable cosine annealing"
+    )
+    parser.add_argument("--eta-min", type=float, default=1e-6, help="Minimum learning rate for cosine annealing")
+    parser.add_argument("--warmup-epochs", type=int, default=0, help="Number of warmup epochs before cosine annealing")
 
     args = parser.parse_args()
 
